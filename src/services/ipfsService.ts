@@ -89,3 +89,35 @@ export function ipfsToHttp(uri: string): string {
   }
   return uri;
 }
+
+export function arToHttp(uri: string): string {
+  if (uri.startsWith('ar://')) {
+    return `https://arweave.net/${uri.slice('ar://'.length)}`;
+  }
+  return uri;
+}
+
+/**
+ * Normalize a token-metadata / image URI to an HTTP(S) URL that the browser
+ * can fetch. Accepts http(s), ipfs://, ar://, bare IPFS CIDs (v0/v1) and
+ * bare Arweave transaction ids. Returns null for anything unrecognised or empty.
+ */
+export function normalizeToHttp(uri: string | undefined | null): string | null {
+  if (!uri) return null;
+  const trimmed = uri.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+  if (trimmed.startsWith('ipfs://')) return ipfsToHttp(trimmed);
+  if (trimmed.startsWith('ar://')) return arToHttp(trimmed);
+  if (!trimmed.includes('/')) {
+    // Bare Arweave transaction id: 43 chars, base64url alphabet.
+    if (/^[A-Za-z0-9_-]{43}$/.test(trimmed)) {
+      return `https://arweave.net/${trimmed}`;
+    }
+    // Bare IPFS CID v0 (Qm...) or v1 (b/z/f...).
+    if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(trimmed) || /^[bzf][A-Za-z2-7]{50,}$/.test(trimmed)) {
+      return ipfsToHttp(`ipfs://${trimmed}`);
+    }
+  }
+  return null;
+}

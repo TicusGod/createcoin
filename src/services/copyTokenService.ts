@@ -30,7 +30,7 @@ import { buildTreasuryTransferInstruction, calculateTotalFees } from './feeServi
 import { buildComputeBudgetInstructions, getDynamicPriorityFee } from './priorityFeeService';
 import { confirmTransactionWithBackgroundFallback, sendRawTransactionWithSimulationFallback } from './solanaTxHelpers';
 import type { TokenMetadataJson } from './ipfsService';
-import { uploadMetadata, ipfsToHttp } from './ipfsService';
+import { uploadMetadata, normalizeToHttp } from './ipfsService';
 import { getCoinDetails } from './pumpFunService';
 import { fetchDigitalAsset } from '@metaplex-foundation/mpl-token-metadata';
 
@@ -49,16 +49,8 @@ const COPY_TRENDING_METADATA_AND_BUFFER_LAMPORTS = 20_000_000;
 const COPY_TRENDING_MAX_DYNAMIC_FEE_LAMPORTS = Math.round(0.5 * LAMPORTS_PER_SOL);
 const COPY_TRENDING_FETCH_TIMEOUT_MS = 30_000;
 
-function isReusableMetadataUri(value: string | undefined): value is string {
-  if (!value) return false;
-  const trimmed = value.trim();
-  return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('ipfs://');
-}
-
 function isReusableImageUri(value: string | undefined): value is string {
-  if (!value) return false;
-  const trimmed = value.trim();
-  return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('ipfs://');
+  return normalizeToHttp(value) !== null;
 }
 
 function supplyBn(supplyUi: number, decimals: number): BN {
@@ -131,8 +123,8 @@ export async function copyTrendingToken(params: {
     name = pump.name;
     symbol = pump.symbol.replace(/^\$/, '');
     description = pump.description;
-    imageHttp = pump.imageUri;
-    sourceMetadataUri = isReusableMetadataUri(pump.metadataUri) ? pump.metadataUri : undefined;
+    imageHttp = normalizeToHttp(pump.imageUri) ?? pump.imageUri;
+    sourceMetadataUri = normalizeToHttp(pump.metadataUri) ?? undefined;
     twitter = pump.twitter;
     telegram = pump.telegram;
     website = pump.website;
@@ -140,16 +132,18 @@ export async function copyTrendingToken(params: {
     const umiRead = createUmi(params.connection).use(mplTokenMetadata());
     const asset = await fetchDigitalAsset(umiRead, umiPublicKey(params.sourceMint)).catch(() => null);
     if (asset?.metadata) {
-      name = asset.metadata.name;
+      name = (asset.metadata.name || '').replace(/\0/g, '').trim() || name;
       symbol = asset.metadata.symbol.replace(/\0/g, '').trim() || symbol;
-      description = asset.metadata.uri;
-      const uri = asset.metadata.uri;
-      sourceMetadataUri = isReusableMetadataUri(uri) ? uri : undefined;
-      if (uri.startsWith('http')) {
+      const uri = (asset.metadata.uri || '').replace(/\0/g, '').trim();
+      const httpUri = normalizeToHttp(uri);
+      sourceMetadataUri = httpUri ?? undefined;
+      description = uri;
+      if (httpUri) {
         try {
-          const { data } = await axios.get<Record<string, unknown>>(uri, { timeout: COPY_TRENDING_FETCH_TIMEOUT_MS });
+          const { data } = await axios.get<Record<string, unknown>>(httpUri, { timeout: COPY_TRENDING_FETCH_TIMEOUT_MS });
           const img = typeof data.image === 'string' ? data.image : '';
-          imageHttp = img.startsWith('ipfs://') ? ipfsToHttp(img) : img;
+          const imgHttp = normalizeToHttp(img);
+          if (imgHttp) imageHttp = imgHttp;
           if (typeof data.description === 'string') description = data.description;
         } catch {
           description = uri;
@@ -163,12 +157,19 @@ export async function copyTrendingToken(params: {
   let metadataUri = sourceMetadataUri;
 
   if (!metadataUri) {
-    if (!isReusableImageUri(imageHttp)) {
+    // Fall back to synthesising our own metadata JSON. We need at least a
+    // recognisable name/symbol from the source; without them the copy would
+    // be a blank token and the user almost certainly hit a wrong mint.
+    const gotSourceInfo =
+      (name && name !== 'Token') || (symbol && symbol !== 'TKN') || isReusableImageUri(imageHttp);
+    if (!gotSourceInfo) {
       throw new Error('Could not resolve source metadata');
     }
 
     // Reuse the source image URL directly when possible so the wallet popup appears faster.
-    const metadataImageUri = imageHttp.startsWith('ipfs://') ? imageHttp : imageHttp.trim();
+    const metadataImageUri = isReusableImageUri(imageHttp)
+      ? imageHttp.startsWith('ipfs://') ? imageHttp : imageHttp.trim()
+      : '';
     const metaJson: TokenMetadataJson = {
       name,
       symbol: symbol.toUpperCase(),
