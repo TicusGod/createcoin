@@ -1,6 +1,10 @@
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { useCallback, useState } from 'react';
-import { copyTrendingToken, type CopyStage } from '../services/copyTokenService';
+import {
+  copyTrendingToken,
+  type CopyStage,
+  type CopyTrendingSourceHint,
+} from '../services/copyTokenService';
 
 export function useCopyToken() {
   const { connection } = useConnection();
@@ -10,7 +14,7 @@ export function useCopyToken() {
   const [error, setError] = useState<string | null>(null);
 
   const copy = useCallback(
-    async (sourceMint: string) => {
+    async (sourceMint: string, sourceHint?: CopyTrendingSourceHint) => {
       setIsCopying(true);
       setError(null);
       setStage(null);
@@ -19,6 +23,7 @@ export function useCopyToken() {
           connection,
           wallet,
           sourceMint,
+          sourceHint,
           onProgress: (s) => setStage(s),
         });
       } catch (e) {

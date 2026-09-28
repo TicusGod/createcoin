@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { RefreshCw, Zap } from 'lucide-react';
 import LaunchSuccessModal from './LaunchSuccessModal';
 import { useSolanaWallet } from '../hooks/useSolanaWallet';
 import { useTrendingCoins } from '../hooks/useTrendingCoins';
 import { useCopyToken } from '../hooks/useCopyToken';
-import { estimateMinLamportsForCopyTrending } from '../services/copyTokenService';
+import { prefetchCopyMetadata, prewarmCopyTrendingRpc } from '../services/copyTokenService';
 import { useAppStore } from '../stores/useAppStore';
 import { env } from '../config/env';
 import { withTransactionToast } from '../utils/transactionToast';
@@ -23,6 +22,11 @@ interface TrendingToken {
   dexUrl: string | null;
   xUrl: string | null;
   telegramUrl: string | null;
+  rawImageUri: string;
+  description: string;
+  twitter?: string;
+  telegram?: string;
+  website?: string;
 }
 
 /** Coins using this CDN are hidden; copy flow cannot resolve images for them. */
@@ -104,16 +108,51 @@ function TelegramIcon() {
 function TokenCard({
   token,
   onCopy,
+  onPrefetch,
   copying,
 }: {
   token: TrendingToken;
   onCopy: (token: TrendingToken) => void;
+  onPrefetch: (token: TrendingToken) => void;
   copying: string | null;
 }) {
   const isCopying = copying === token.id;
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof window === 'undefined' || !('IntersectionObserver' in window)) return;
+    let scheduled: number | null = null;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            // Delay so a fast scroll past the card does not fire a Pinata upload.
+            if (scheduled === null) {
+              scheduled = window.setTimeout(() => {
+                onPrefetch(token);
+              }, 700);
+            }
+          } else if (scheduled !== null) {
+            window.clearTimeout(scheduled);
+            scheduled = null;
+          }
+        }
+      },
+      { rootMargin: '80px', threshold: 0.4 },
+    );
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      if (scheduled !== null) window.clearTimeout(scheduled);
+    };
+  }, [onPrefetch, token]);
 
   return (
-    <div className="bg-[#18191b] rounded-[16px] p-5 flex flex-col gap-4 border border-[#212225] hover:border-[#272a2d] transition-all duration-150">
+    <div
+      ref={containerRef}
+      className="bg-[#18191b] rounded-[16px] p-5 flex flex-col gap-4 border border-[#212225] hover:border-[#272a2d] transition-all duration-150"
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3">
           <img
@@ -161,6 +200,8 @@ function TokenCard({
         </div>
         <button
           onClick={() => onCopy(token)}
+          onMouseEnter={() => onPrefetch(token)}
+          onFocus={() => onPrefetch(token)}
           disabled={isCopying}
           className="inline-flex items-center gap-1.5 h-9 px-4 rounded-[10px] bg-[#86efac] text-[#052e16] text-xs font-semibold transition-all duration-150 hover:bg-[#bbf7d0] active:translate-y-px disabled:opacity-50 disabled:cursor-not-allowed select-none"
         >
@@ -192,6 +233,7 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
   const [copying, setCopying] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [launchResult, setLaunchResult] = useState<{ mintAddress: string; isVirtual: boolean } | null>(null);
+  const metadataPrefetchRef = useRef<Map<string, Promise<string>>>(new Map());
 
   const { publicKey, connected } = useWallet();
   const { connection } = useConnection();
@@ -200,7 +242,6 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
   const { copyToken } = useCopyToken();
   const addUserToken = useAppStore((s) => s.addUserToken);
   const recordTransaction = useAppStore((s) => s.recordTransaction);
-  const isFeeExemptWallet = !!publicKey && env.isFeeExemptWallet(publicKey);
 
   const updatePillPosition = useCallback(() => {
     const el = tabRefs.current[tab];
@@ -224,6 +265,17 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
     if (!loading) setRefreshing(false);
   }, [loading]);
 
+  // Warm the RPC caches (rent exemption, blockhash, priority fee, balance) the
+  // moment the page opens or the wallet reconnects, so the Copy Coin click has
+  // zero RPC latency in the hot path.
+  useEffect(() => {
+    prewarmCopyTrendingRpc(connection, publicKey ?? undefined);
+    const id = window.setInterval(() => {
+      prewarmCopyTrendingRpc(connection, publicKey ?? undefined);
+    }, 4_000);
+    return () => window.clearInterval(id);
+  }, [connection, publicKey]);
+
   const tokens: TrendingToken[] = useMemo(
     () =>
       coins
@@ -239,6 +291,11 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
           dexUrl: c.dexUrl,
           xUrl: normalizeSocialUrl(c.twitter, 'twitter'),
           telegramUrl: normalizeSocialUrl(c.telegram, 'telegram'),
+          rawImageUri: c.imageUri,
+          description: c.description,
+          twitter: c.twitter,
+          telegram: c.telegram,
+          website: c.website,
         })),
     [coins],
   );
@@ -247,6 +304,41 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
     setRefreshing(true);
     setPage((prev) => prev + 1);
   };
+
+  const buildHint = (token: TrendingToken) => ({
+    name: token.name,
+    symbol: token.symbol.replace(/^\$/, ''),
+    description: token.description,
+    imageUri: token.rawImageUri || (token.imageUrl !== PLACEHOLDER_IMG ? token.imageUrl : undefined),
+    twitter: token.twitter,
+    telegram: token.telegram,
+    website: token.website,
+  });
+
+  const handlePrefetch = useCallback((token: TrendingToken) => {
+    const cache = metadataPrefetchRef.current;
+    if (cache.has(token.id)) return;
+    const promise = prefetchCopyMetadata(buildHint(token)).catch((e) => {
+      // Drop the failed attempt so the copy flow can retry inline.
+      cache.delete(token.id);
+      throw e;
+    });
+    cache.set(token.id, promise);
+  }, []);
+
+  // Eagerly prefetch metadata for the first few visible cards so a fast click
+  // on top-of-page tokens does not wait on Pinata even without a hover.
+  useEffect(() => {
+    if (!tokens.length) return;
+    const timers: number[] = [];
+    tokens.slice(0, 4).forEach((token, i) => {
+      const id = window.setTimeout(() => handlePrefetch(token), 150 + i * 120);
+      timers.push(id);
+    });
+    return () => {
+      timers.forEach((id) => window.clearTimeout(id));
+    };
+  }, [tokens, handlePrefetch]);
 
   const handleCopy = async (token: TrendingToken) => {
     if (!connected) {
@@ -260,26 +352,26 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
       return;
     }
 
-    if (!isFeeExemptWallet) {
-      try {
-        const balance = await connection.getBalance(publicKey, 'confirmed');
-        const minLamports = await estimateMinLamportsForCopyTrending(connection, publicKey, balance);
-        if (balance < minLamports) {
-          const need = (minLamports / LAMPORTS_PER_SOL).toFixed(3);
-          const have = (balance / LAMPORTS_PER_SOL).toFixed(4);
-          toast.error(`Insufficient SOL. Need ~${need} SOL; you have ${have} SOL.`);
-          return;
-        }
-      } catch {
-        toast.error('Could not verify balance. Check your connection and try again.');
-        return;
-      }
-    }
+    // Precise rent-based balance check is done inline inside copyTrendingToken so we
+    // don't need two extra RPC round-trips before the wallet popup here.
 
     setCopying(token.id);
     try {
       await withTransactionToast('Copying trending token', async () => {
-        const res = await copyToken(token.id);
+        const hint = buildHint(token);
+        const prefetched = metadataPrefetchRef.current.get(token.id);
+        let prefetchedUri: string | undefined;
+        if (prefetched) {
+          try {
+            prefetchedUri = await prefetched;
+          } catch {
+            // Fall back to inline upload below.
+          }
+        }
+        const res = await copyToken(token.id, {
+          ...hint,
+          metadataUri: prefetchedUri,
+        });
         addUserToken(w, {
           mint: res.mint.toBase58(),
           name: token.name,
@@ -382,7 +474,13 @@ export default function CopyTrending({ onGoToLiquidity }: { onGoToLiquidity: (mi
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {tokens.map((token) => (
-                <TokenCard key={token.id} token={token} onCopy={handleCopy} copying={copying} />
+                <TokenCard
+                  key={token.id}
+                  token={token}
+                  onCopy={handleCopy}
+                  onPrefetch={handlePrefetch}
+                  copying={copying}
+                />
               ))}
             </div>
           )}

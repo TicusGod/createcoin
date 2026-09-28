@@ -86,6 +86,13 @@ function normalizeList(payload: unknown): PumpFunCoin[] {
   return out;
 }
 
+function isTransientAxiosError(e: unknown): boolean {
+  if (!axios.isAxiosError(e)) return true;
+  const status = e.response?.status;
+  if (typeof status !== 'number') return true; // network / timeout
+  return status === 429 || status >= 500;
+}
+
 async function axiosRetry<T>(fn: () => Promise<T>): Promise<T> {
   let last: unknown;
   for (let i = 0; i < 3; i++) {
@@ -93,6 +100,7 @@ async function axiosRetry<T>(fn: () => Promise<T>): Promise<T> {
       return await fn();
     } catch (e) {
       last = e;
+      if (!isTransientAxiosError(e)) throw e; // 4xx (incl. 404) — no retry
       await new Promise((r) => setTimeout(r, 400 * 2 ** i));
     }
   }
